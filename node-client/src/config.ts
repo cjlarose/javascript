@@ -10,8 +10,6 @@ import yaml = require('js-yaml');
 import api = require('./api');
 import { Cluster, newClusters, User, newUsers, Context, newContexts } from './config_types';
 
-import client = require('./auth-wrapper');
-
 export class KubeConfig {
     /**
      * The list of all known clusters
@@ -175,6 +173,10 @@ export class KubeConfig {
     }
 }
 
+export interface Client {
+  setDefaultAuthentication(auth: api.Authentication): void;
+}
+
 export class Config {
     public static SERVICEACCOUNT_ROOT =
     '/var/run/secrets/kubernetes.io/serviceaccount';
@@ -183,17 +185,17 @@ export class Config {
     public static SERVICEACCOUNT_TOKEN_PATH =
     Config.SERVICEACCOUNT_ROOT + '/token';
 
-    public static fromFile(filename: string): api.Core_v1Api {
+    public static fromFile<T extends Client>(filename: string, ctor: new (baseUri: string) => T): T {
         let kc = new KubeConfig();
         kc.loadFromFile(filename);
 
-        let k8sApi = new client.Core_v1Api(kc.getCurrentCluster()['server']);
+        let k8sApi = new ctor(kc.getCurrentCluster()['server']);
         k8sApi.setDefaultAuthentication(kc);
 
         return k8sApi;
     }
 
-    public static fromCluster(): api.Core_v1Api {
+    public static fromCluster<T extends Client>(ctor: new (baseUri: string) => T): T {
         let host = process.env.KUBERNETES_SERVICE_HOST
         let port = process.env.KUBERNETES_SERVICE_PORT
 
@@ -201,7 +203,7 @@ export class Config {
         let caCert = fs.readFileSync(Config.SERVICEACCOUNT_CA_PATH);
         let token = fs.readFileSync(Config.SERVICEACCOUNT_TOKEN_PATH);
 
-        let k8sApi = new client.Core_v1Api('https://' + host + ':' + port);
+        let k8sApi = new ctor('https://' + host + ':' + port);
         k8sApi.setDefaultAuthentication({
             'applyToRequest': (opts) => {
                 opts.ca = caCert;
@@ -212,20 +214,20 @@ export class Config {
         return k8sApi;
     }
 
-    public static defaultClient(): api.Core_v1Api {
+    public static defaultClient<T extends Client>(ctor: new (baseUri: string) => T): T {
         if (process.env.KUBECONFIG) {
-            return Config.fromFile(process.env.KUBECONFIG);
+            return Config.fromFile(process.env.KUBECONFIG, ctor);
         }
 
         let config = path.join(process.env.HOME, ".kube", "config");
         if (fs.existsSync(config)) {
-            return Config.fromFile(config);
+            return Config.fromFile(config, ctor);
         }
 
         if (fs.existsSync(Config.SERVICEACCOUNT_TOKEN_PATH)) {
-            return Config.fromCluster();
+            return Config.fromCluster(ctor);
         }
 
-        return new client.Core_v1Api('http://localhost:8080');
+        return new ctor('http://localhost:8080');
     }
 }

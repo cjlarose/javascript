@@ -1,3 +1,4 @@
+import https = require('https');
 import fs = require('fs');
 import os = require('os');
 import path = require('path');
@@ -9,8 +10,6 @@ import shelljs = require('shelljs');
 import yaml = require('js-yaml');
 import api = require('./api');
 import { Cluster, newClusters, User, newUsers, Context, newContexts } from './config_types';
-
-import client = require('./auth-wrapper');
 
 export class KubeConfig {
     /**
@@ -106,16 +105,8 @@ export class KubeConfig {
         return null;
     }
 
-    public applyToRequest(opts: request.Options) {
-        let cluster = this.getCurrentCluster();
+    private getAuthorizationToken(): string | null {
         let user = this.getCurrentUser();
-
-        if (cluster.skipTLSVerify) {
-            opts.strictSSL = false
-        }
-        opts.ca = this.bufferFromFileOrString(cluster.caFile, cluster.caData);
-        opts.cert = this.bufferFromFileOrString(user.certFile, user.certData);
-        opts.key = this.bufferFromFileOrString(user.keyFile, user.keyData);
         let token = null;
         if (user.authProvider && user.authProvider.config) {
             let config = user.authProvider.config;
@@ -152,6 +143,47 @@ export class KubeConfig {
         if (user.token) {
             token = 'Bearer ' + user.token;
         }
+        return token;
+    }
+
+    private getHttpsCredentials() {
+        const cluster = this.getCurrentCluster();
+        const user = this.getCurrentUser();
+
+        return {
+            ca: this.bufferFromFileOrString(cluster.caFile, cluster.caData),
+            cert: this.bufferFromFileOrString(user.certFile, user.certData),
+            key: this.bufferFromFileOrString(user.keyFile, user.keyData),
+        };
+    }
+
+    public applyToHttpsOptions(opts: https.RequestOptions) {
+        const user = this.getCurrentUser();
+        const { ca, cert, key } = this.getHttpsCredentials();
+        opts.ca = ca;
+        opts.cert = cert;
+        opts.key = key;
+        const token = this.getAuthorizationToken();
+        if (token) {
+            opts.headers['Authorization'] = token;
+        }
+        if (user.username) {
+          opts.auth = `${user.username}:${user.password}`;
+        }
+    }
+
+    public applyToRequest(opts: request.Options) {
+        let cluster = this.getCurrentCluster();
+        let user = this.getCurrentUser();
+
+        if (cluster.skipTLSVerify) {
+            opts.strictSSL = false
+        }
+        const { ca, cert, key } = this.getHttpsCredentials();
+        opts.ca = ca;
+        opts.cert = cert;
+        opts.key = key;
+        const token = this.getAuthorizationToken();
         if (token) {
             opts.headers['Authorization'] = token;
         }
@@ -165,14 +197,18 @@ export class KubeConfig {
 
     public loadFromString(config: string) {
         var obj = yaml.safeLoad(config);
-        if (obj.apiVersion != 'v1') {
-            throw new TypeError('unknown version: ' + obj.apiVersion);
+        if (obj['apiVersion'] != 'v1') {
+            throw new TypeError('unknown version: ' + obj['apiVersion']);
         }
-        this.clusters = newClusters(obj.clusters);
-        this.contexts = newContexts(obj.contexts);
-        this.users = newUsers(obj.users);
+        this.clusters = newClusters(obj['clusters']);
+        this.contexts = newContexts(obj['contexts']);
+        this.users = newUsers(obj['users']);
         this.currentContext = obj['current-context'];
     }
+}
+
+export interface Client {
+  setDefaultAuthentication(auth: api.Authentication): void;
 }
 
 export class Config {
@@ -183,17 +219,17 @@ export class Config {
     public static SERVICEACCOUNT_TOKEN_PATH =
     Config.SERVICEACCOUNT_ROOT + '/token';
 
-    public static fromFile(filename: string): api.Core_v1Api {
+    public static fromFile<T extends Client>(filename: string, ctor: new (baseUri: string) => T): T {
         let kc = new KubeConfig();
         kc.loadFromFile(filename);
 
-        let k8sApi = new client.Core_v1Api(kc.getCurrentCluster()['server']);
+        let k8sApi = new ctor(kc.getCurrentCluster()['server']);
         k8sApi.setDefaultAuthentication(kc);
 
         return k8sApi;
     }
 
-    public static fromCluster(): api.Core_v1Api {
+    public static fromCluster<T extends Client>(ctor: new (baseUri: string) => T): T {
         let host = process.env.KUBERNETES_SERVICE_HOST
         let port = process.env.KUBERNETES_SERVICE_PORT
 
@@ -201,7 +237,7 @@ export class Config {
         let caCert = fs.readFileSync(Config.SERVICEACCOUNT_CA_PATH);
         let token = fs.readFileSync(Config.SERVICEACCOUNT_TOKEN_PATH);
 
-        let k8sApi = new client.Core_v1Api('https://' + host + ':' + port);
+        let k8sApi = new ctor('https://' + host + ':' + port);
         k8sApi.setDefaultAuthentication({
             'applyToRequest': (opts) => {
                 opts.ca = caCert;
@@ -212,20 +248,20 @@ export class Config {
         return k8sApi;
     }
 
-    public static defaultClient(): api.Core_v1Api {
+    public static defaultClient<T extends Client>(ctor: new (baseUri: string) => T): T {
         if (process.env.KUBECONFIG) {
-            return Config.fromFile(process.env.KUBECONFIG);
+            return Config.fromFile(process.env.KUBECONFIG, ctor);
         }
 
         let config = path.join(process.env.HOME, ".kube", "config");
         if (fs.existsSync(config)) {
-            return Config.fromFile(config);
+            return Config.fromFile(config, ctor);
         }
 
         if (fs.existsSync(Config.SERVICEACCOUNT_TOKEN_PATH)) {
-            return Config.fromCluster();
+            return Config.fromCluster(ctor);
         }
 
-        return new client.Core_v1Api('http://localhost:8080');
+        return new ctor('http://localhost:8080');
     }
 }
